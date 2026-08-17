@@ -1,379 +1,235 @@
-import os
 import re
 import random
 from datetime import datetime, timedelta
+from pathlib import Path
 import pdfplumber
 from docx import Document
 
-# Tenta importar num2words; caso não esteja instalado, utiliza função de fallback
+# Tenta importar num2words (Fallback mantido)
 try:
     from num2words import num2words
     HAS_NUM2WORDS = True
 except ImportError:
     HAS_NUM2WORDS = False
 
-# Mapeamento de meses em português
-MESES = {
-    1: "JANEIRO", 2: "FEVEREIRO", 3: "MARÇO", 4: "ABRIL",
-    5: "MAIO", 6: "JUNHO", 7: "JULHO", 8: "AGOSTO",
-    9: "SETEMBRO", 10: "OUTUBRO", 11: "NOVEMBRO", 12: "DEZEMBRO"
-}
+# Lista de meses (índice bate com o número do mês)
+MESES = ["", "JANEIRO", "FEVEREIRO", "MARÇO", "ABRIL", "MAIO", "JUNHO", 
+         "JULHO", "AGOSTO", "SETEMBRO", "OUTUBRO", "NOVEMBRO", "DEZEMBRO"]
 
-# Constantes para conversão manual de números por extenso (fallback)
+# Constantes para conversão manual
 UNIDADES = ["", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito", "nove",
             "dez", "onze", "doze", "treze", "quatorze", "quinze", "dezesseis", "dezessete", "dezoito", "dezenove"]
 DEZENAS = ["", "", "vinte", "trinta", "quarenta", "cinquenta", "sessenta", "setenta", "oitenta", "noventa"]
 CENTENAS = ["", "cento", "duzentos", "trezentos", "quatrocentos", "quinhentos", "seiscentos", "setecentos", "oitocentos", "novecentos"]
 
-def _converter_grupo(n):
-    if n == 0:
-        return ""
-    if n == 100:
-        return "cem"
-    c = n // 100
-    d = (n % 100) // 10
-    u = n % 10
-    partes = []
-    if c > 0:
-        partes.append(CENTENAS[c])
+# Expressões regulares pré-compiladas (melhor performance)
+RE_NF = re.compile(r"Nº\s*(\d+)")
+RE_DATA_EMISSAO = re.compile(r"DATA DE EMISSÃO\n*(\d{2}/\d{2}/\d{4})")
+RE_DATA_ANY = re.compile(r"(\d{2}/\d{2}/\d{4})")
+RE_CLIENTE = re.compile(r"NOME/RAZÃO SOCIAL\n*(.*?)\n")
+RE_CNPJ = re.compile(r"CNPJ/CPF\n*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})")
+
+def format_brl(valor: float) -> str:
+    """Formata float para formato moeda BRL (ex: 1.234,56)."""
+    return f"{valor:,.2f}".translate(str.maketrans(',.', '.,'))
+
+def _converter_grupo(n: int) -> str:
+    if n == 0: return ""
+    if n == 100: return "cem"
+    
+    c, d, u = n // 100, (n % 100) // 10, n % 10
+    partes = [CENTENAS[c]] if c > 0 else []
+    
     if d == 1:
         partes.append(UNIDADES[d * 10 + u])
     else:
-        if d > 1:
-            partes.append(DEZENAS[d])
-        if u > 0:
-            partes.append(UNIDADES[u])
+        if d > 1: partes.append(DEZENAS[d])
+        if u > 0: partes.append(UNIDADES[u])
+        
     return " e ".join(partes)
 
-def valor_para_extenso_manual(valor):
-    """Converte valor monetário numérico para extenso em maiúsculas (Python Puro)."""
-    valor = round(valor, 2)
-    inteiro = int(valor)
-    centavos = int(round((valor - inteiro) * 100))
+def valor_para_extenso_manual(valor: float) -> str:
+    """Converte numérico para extenso (Fallback nativo)."""
+    inteiro, centavos = int(valor), int(round((valor - int(valor)) * 100))
+    if valor == 0: return "ZERO REAIS"
     
-    if valor == 0:
-        return "ZERO REAIS"
-    
-    partes_int = []
-    milhoes = inteiro // 1_000_000
-    milhares = (inteiro % 1_000_000) // 1_000
-    unidades = inteiro % 1_000
-
-    if milhoes > 0:
-        ext_m = _converter_grupo(milhoes)
-        partes_int.append(f"{ext_m} {'milhão' if milhoes == 1 else 'milhões'}")
-    if milhares > 0:
-        ext_k = _converter_grupo(milhares)
-        if ext_k == "um":
-            partes_int.append("um mil")
-        else:
-            partes_int.append(f"{ext_k} mil")
-    if unidades > 0:
-        ext_u = _converter_grupo(unidades)
-        partes_int.append(ext_u)
+    partes = []
+    if (m := inteiro // 1_000_000) > 0:
+        partes.append(f"{_converter_grupo(m)} {'milhão' if m == 1 else 'milhões'}")
+    if (k := (inteiro % 1_000_000) // 1_000) > 0:
+        ext_k = _converter_grupo(k)
+        partes.append("um mil" if ext_k == "um" else f"{ext_k} mil")
+    if (u := inteiro % 1_000) > 0:
+        partes.append(_converter_grupo(u))
 
     txt_int = ""
-    if partes_int:
-        if len(partes_int) > 1:
-            txt_int = " ".join(partes_int[:-1]) + " e " + partes_int[-1]
-        else:
-            txt_int = partes_int[0]
-            
+    if partes:
+        txt_int = " ".join(partes[:-1]) + " e " + partes[-1] if len(partes) > 1 else partes[0]
         txt_int += " real" if inteiro == 1 else " reais"
 
-    txt_cent = ""
-    if centavos > 0:
-        ext_c = _converter_grupo(centavos)
-        txt_cent = f"{ext_c} centavo" if centavos == 1 else f"{ext_c} centavos"
+    txt_cent = f"{_converter_grupo(centavos)} centavo{'s' if centavos > 1 else ''}" if centavos > 0 else ""
+    return " e ".join(filter(None, [txt_int, txt_cent])).upper()
 
-    if txt_int and txt_cent:
-        resultado = f"{txt_int} e {txt_cent}"
-    elif txt_int:
-        resultado = txt_int
-    else:
-        resultado = txt_cent
-
-    return resultado.upper()
-
-def valor_por_extenso(valor):
-    """Retorna o valor por extenso em MAIÚSCULAS usando num2words ou fallback."""
+def valor_por_extenso(valor: float) -> str:
     if HAS_NUM2WORDS:
-        try:
-            return num2words(valor, lang='pt_BR', to='currency').upper()
-        except Exception:
-            pass
+        try: return num2words(valor, lang='pt_BR', to='currency').upper()
+        except Exception: pass
     return valor_para_extenso_manual(valor)
 
-def subtrair_dias_uteis(data, dias=2):
-    """Subtrai dias úteis ignorando sábados e domingos."""
-    dias_subtraidos = 0
-    data_atual = data
-    while dias_subtraidos < dias:
-        data_atual -= timedelta(days=1)
-        if data_atual.weekday() < 5:  # 0-4 é Segunda a Sexta
-            dias_subtraidos += 1
-    return data_atual
-
-def formatar_data_word(data_obj):
-    """Formata a data no padrão: DD DE MÊS DE YYYY"""
-    dia = data_obj.strftime("%d")
-    mes = MESES[data_obj.month]
-    ano = data_obj.year
-    return f"{dia} DE {mes} DE {ano}"
-
-def extrair_dados_pdf(caminho_pdf):
-    """Extrai informações relevantes e itens de todas as páginas da NF."""
-    dados = {
-        "numero_nf": None,
-        "cliente": None,
-        "cnpj": None,
-        "data_emissao": None,
-        "itens": []
-    }
+def extrair_dados_pdf(caminho_pdf: Path) -> dict:
+    """Extrai informações e itens das páginas da NF."""
+    dados = {"numero_nf": "000", "cliente": "", "cnpj": "", "data_emissao": datetime.now(), "itens": []}
+    texto_completo = ""
 
     with pdfplumber.open(caminho_pdf) as pdf:
-        texto_completo = ""
         for page in pdf.pages:
             texto_completo += (page.extract_text() or "") + "\n"
-
-            tables = page.extract_tables()
-            for table in tables:
+            for table in page.extract_tables():
                 for row in table:
                     if row and len(row) >= 9 and row[0] and row[0].isdigit():
-                        descricao = row[1].replace("\n", " ") if row[1] else ""
-                        unidade = row[5] if row[5] else ""
-                        
                         try:
-                            qtd = float(row[6].replace(".", "").replace(",", "."))
-                            vlr_unit = float(row[7].replace(".", "").replace(",", "."))
-                            vlr_total = float(row[8].replace(".", "").replace(",", "."))
-                            
                             dados["itens"].append({
-                                "descricao": descricao,
-                                "und": unidade,
-                                "qtd": qtd,
-                                "vlr_unit": vlr_unit,
-                                "vlr_total": vlr_total
+                                "descricao": (row[1] or "").replace("\n", " "),
+                                "und": row[5] or "",
+                                "qtd": float(row[6].translate(str.maketrans('', '', '.')) .replace(",", ".")),
+                                "vlr_unit": float(row[7].translate(str.maketrans('', '', '.')) .replace(",", ".")),
+                                "vlr_total": float(row[8].translate(str.maketrans('', '', '.')) .replace(",", "."))
                             })
                         except (ValueError, TypeError):
                             continue
 
-        nf_match = re.search(r"Nº\s*(\d+)", texto_completo)
-        if nf_match:
-            dados["numero_nf"] = nf_match.group(1)
-
-        data_match = re.search(r"DATA DE EMISSÃO\n*(\d{2}/\d{2}/\d{4})", texto_completo)
-        if not data_match:
-            data_match = re.search(r"(\d{2}/\d{2}/\d{4})", texto_completo)
-        if data_match:
-            dados["data_emissao"] = datetime.strptime(data_match.group(1), "%d/%m/%Y")
-
-        cliente_match = re.search(r"NOME/RAZÃO SOCIAL\n*(.*?)\n", texto_completo)
-        if cliente_match:
-            dados["cliente"] = cliente_match.group(1).strip()
-
-        cnpj_match = re.search(r"CNPJ/CPF\n*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", texto_completo)
-        if cnpj_match:
-            dados["cnpj"] = cnpj_match.group(1).strip()
+    if match := RE_NF.search(texto_completo): dados["numero_nf"] = match.group(1)
+    if match := RE_DATA_EMISSAO.search(texto_completo) or RE_DATA_ANY.search(texto_completo):
+        dados["data_emissao"] = datetime.strptime(match.group(1), "%d/%m/%Y")
+    if match := RE_CLIENTE.search(texto_completo): dados["cliente"] = match.group(1).strip()
+    if match := RE_CNPJ.search(texto_completo): dados["cnpj"] = match.group(1).strip()
 
     return dados
 
-def reajustar_valores(itens, percentual=0.03):
-    """
-    Aumenta o valor total no percentual informado, distribuindo variações
-    aleatórias nos valores unitários dos itens.
-    """
-    total_original = sum(item["vlr_total"] for item in itens)
-    total_alvo = round(total_original * (1 + percentual), 2)
-    
-    novos_itens = []
-    soma_provisoria = 0.0
+def reajustar_valores(itens: list, percentual: float = 0.03) -> tuple:
+    """Aumenta o valor total, distribuindo nos itens de forma aleatória."""
+    total_alvo = round(sum(i["vlr_total"] for i in itens) * (1 + percentual), 2)
+    novos_itens, soma = [], 0.0
 
-    for item in itens:
-        min_fator = 1.0 + max(0.005, percentual - 0.02)
-        max_fator = 1.0 + percentual + 0.02
-        fator_aleatorio = random.uniform(min_fator, max_fator)
-        novo_vlr_unit = round(item["vlr_unit"] * fator_aleatorio, 2)
-        novo_vlr_total = round(novo_vlr_unit * item["qtd"], 2)
+    for i in itens:
+        fator = random.uniform(1.0 + max(0.005, percentual - 0.02), 1.0 + percentual + 0.02)
+        vlr_unit = round(i["vlr_unit"] * fator, 2)
+        vlr_total = round(vlr_unit * i["qtd"], 2)
+        novos_itens.append({**i, "vlr_unit": vlr_unit, "vlr_total": vlr_total})
+        soma += vlr_total
 
-        novos_itens.append({
-            "descricao": item["descricao"],
-            "und": item["und"],
-            "qtd": item["qtd"],
-            "vlr_unit": novo_vlr_unit,
-            "vlr_total": novo_vlr_total
-        })
-        soma_provisoria += novo_vlr_total
-
-    diferenca = round(total_alvo - soma_provisoria, 2)
-    if novos_itens and diferenca != 0:
+    if novos_itens and (dif := round(total_alvo - soma, 2)) != 0:
         ultimo = novos_itens[-1]
-        ultimo["vlr_total"] = round(ultimo["vlr_total"] + diferenca, 2)
+        ultimo["vlr_total"] = round(ultimo["vlr_total"] + dif, 2)
         if ultimo["qtd"] > 0:
             ultimo["vlr_unit"] = round(ultimo["vlr_total"] / ultimo["qtd"], 2)
 
     return novos_itens, total_alvo
 
-def preencher_tabela(tabela, novos_itens):
-    """Identifica dinamicamente a posição das colunas no cabeçalho e preenche a tabela."""
-    if not tabela.rows:
-        return
+def preencher_tabela(tabela, novos_itens: list):
+    """Preenche tabela do Word baseada nas colunas dos cabeçalhos."""
+    if not tabela.rows: return
 
-    col_idx = {"num": 0, "desc": 1, "und": 2, "qtd": 3, "unit": 4, "total": 5}
-    header_cells = [c.text.upper() for c in tabela.rows[0].cells]
-    
-    for idx, text in enumerate(header_cells):
-        if "ORDEM" in text or "ITEM" in text or "Nº" in text:
-            col_idx["num"] = idx
-        elif "UND" in text or "UNID" in text:
-            col_idx["und"] = idx
-        elif "DESC" in text or "PRODUTO" in text or "SERVIÇO" in text:
-            col_idx["desc"] = idx
-        elif "QTD" in text or "QUANT" in text:
-            col_idx["qtd"] = idx
-        elif "UNIT" in text or "PR. UNIT" in text:
-            col_idx["unit"] = idx
-        elif "TOTAL" in text or "PR. TOTAL" in text:
-            col_idx["total"] = idx
+    headers = [c.text.upper() for c in tabela.rows[0].cells]
+    col = {
+        "num": next((i for i, h in enumerate(headers) if any(x in h for x in ("ORDEM", "ITEM", "Nº"))), 0),
+        "desc": next((i for i, h in enumerate(headers) if any(x in h for x in ("DESC", "PRODUTO", "SERVIÇO"))), 1),
+        "und": next((i for i, h in enumerate(headers) if any(x in h for x in ("UND", "UNID"))), 2),
+        "qtd": next((i for i, h in enumerate(headers) if any(x in h for x in ("QTD", "QUANT"))), 3),
+        "unit": next((i for i, h in enumerate(headers) if any(x in h for x in ("UNIT", "PR. UNIT"))), 4),
+        "total": next((i for i, h in enumerate(headers) if any(x in h for x in ("TOTAL", "PR. TOTAL"))), 5)
+    }
 
     for idx, item in enumerate(novos_itens):
-        row_idx = idx + 1
-        if row_idx >= len(tabela.rows):
-            tabela.add_row()
+        if idx + 1 >= len(tabela.rows): tabela.add_row()
+        cells = tabela.rows[idx + 1].cells
         
-        row_cells = tabela.rows[row_idx].cells
-        if len(row_cells) > max(col_idx.values()):
-            row_cells[col_idx["num"]].text = str(idx + 1)
-            row_cells[col_idx["desc"]].text = str(item["descricao"])
-            row_cells[col_idx["und"]].text = str(item["und"])
-            row_cells[col_idx["qtd"]].text = f"{item['qtd']:.0f}" if item['qtd'].is_integer() else f"{item['qtd']:.2f}".replace(".", ",")
-            row_cells[col_idx["unit"]].text = f"{item['vlr_unit']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-            row_cells[col_idx["total"]].text = f"{item['vlr_total']:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+        if len(cells) > max(col.values()):
+            cells[col["num"]].text = str(idx + 1)
+            cells[col["desc"]].text = str(item["descricao"])
+            cells[col["und"]].text = str(item["und"])
+            cells[col["qtd"]].text = f"{item['qtd']:.0f}" if item['qtd'].is_integer() else f"{item['qtd']:.2f}".replace(".", ",")
+            cells[col["unit"]].text = format_brl(item['vlr_unit'])
+            cells[col["total"]].text = format_brl(item['vlr_total'])
 
 def aplicar_fonte_documento(doc, nome_fonte="Mongolian Baiti"):
-    """
-    Garante que a fonte em todo o documento (parágrafos, estilo padrão e tabelas)
-    seja alterada para Mongolian Baiti.
-    """
-    if 'Normal' in doc.styles:
-        doc.styles['Normal'].font.name = nome_fonte
+    """Modifica fonte do doc inteiro usando achatamento de lista para performance."""
+    if 'Normal' in doc.styles: doc.styles['Normal'].font.name = nome_fonte
+    runs = [r for p in doc.paragraphs for r in p.runs] + \
+           [r for t in doc.tables for row in t.rows for c in row.cells for p in c.paragraphs for r in p.runs]
+    for run in runs: run.font.name = nome_fonte
 
-    for p in doc.paragraphs:
-        for run in p.runs:
-            run.font.name = nome_fonte
-
-    for tabela in doc.tables:
-        for row in tabela.rows:
-            for cell in row.cells:
-                for p in cell.paragraphs:
-                    for run in p.runs:
-                        run.font.name = nome_fonte
-
-def preencher_word(template_path, output_path, dados, novos_itens, total_geral, data_formatada, e_template_jw=False):
-    """Preenche o arquivo Word de acordo com os placeholders e aplica a formatação adequada."""
+def preencher_word(template_path: Path, output_path: Path, dados: dict, itens: list, total: float, data_fmt: str, is_jw=False):
+    """Preenche e formata o documento Word."""
     doc = Document(template_path)
-    val_str = f"{total_geral:,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
-    extenso_str = valor_por_extenso(total_geral)
+    val_str, ext_str = format_brl(total), valor_por_extenso(total)
 
-    # 1. Preenchimento de parágrafos
     for p in doc.paragraphs:
-        p_upper = p.text.upper()
-
-        if "FORTALEZA" in p_upper and ("X DE X DE X" in p_upper or "XX DE XX DE XXXX" in p_upper or "XX DE XX DE X" in p_upper):
-            if p.text.startswith("FORTALEZA") or p.text.startswith("Fortaleza"):
-                prefixo = "FORTALEZA" if p.text.isupper() else "Fortaleza"
-                p.text = f"{prefixo}, {data_formatada}"
-
-        if "CLIENTE:" in p_upper and dados.get("cliente"):
+        txt = p.text.upper()
+        if txt.startswith("FORTALEZA") and " DE " in txt:
+            p.text = f"{'FORTALEZA' if p.text.isupper() else 'Fortaleza'}, {data_fmt}"
+        elif "CLIENTE:" in txt and dados.get("cliente"):
             p.text = f"Cliente: {dados['cliente']}"
-        if "CNPJ:" in p_upper and dados.get("cnpj") and not e_template_jw:
+        elif "CNPJ:" in txt and dados.get("cnpj") and not is_jw:
             p.text = f"CNPJ: {dados['cnpj']}"
-
-        if e_template_jw and "VALOR DA PROPOSTA" in p_upper:
-            p.text = f"Valor da Proposta R$ {val_str} ({extenso_str})"
-        elif not e_template_jw and "VALOR TOTAL DA PROPOSTA:" in p_upper:
+        elif is_jw and "VALOR DA PROPOSTA" in txt:
+            p.text = f"Valor da Proposta R$ {val_str} ({ext_str})"
+        elif not is_jw and "VALOR TOTAL DA PROPOSTA:" in txt:
             p.text = f"VALOR TOTAL DA PROPOSTA:  R$ {val_str}"
 
-    # 2. Preenchimento de Tabelas
     if doc.tables:
         tabela = doc.tables[0]
-        preencher_tabela(tabela, novos_itens)
-
-        # Se for o template da JW, aplica NEGRITO em TODAS as células da tabela (cabeçalho e dados)
-        if e_template_jw:
+        preencher_tabela(tabela, itens)
+        if is_jw:
             for row in tabela.rows:
                 for cell in row.cells:
                     for p in cell.paragraphs:
-                        for run in p.runs:
-                            run.bold = True
+                        for run in p.runs: run.bold = True
 
-    # 3. Aplicação da Fonte Mongolian Baiti em TUDO
-    aplicar_fonte_documento(doc, "Mongolian Baiti")
-
+    aplicar_fonte_documento(doc)
     doc.save(output_path)
 
 def processar_notas():
-    pasta_entrada = "notas_entrada"
-    pasta_saida = "propostas_saida"
-    
-    template_lc = "template_lc.docx" if os.path.exists("template_lc.docx") else "template.docx"
-    template_jw = "template_jw.docx"
+    entrada, saida = Path("notas_entrada"), Path("propostas_saida")
+    tpl_lc = Path("template_lc.docx") if Path("template_lc.docx").exists() else Path("template.docx")
+    tpl_jw = Path("template_jw.docx")
 
-    if not os.path.exists(pasta_entrada):
-        os.makedirs(pasta_entrada)
-        print(f"Pasta '{pasta_entrada}' criada. Adicione os PDFs nela e execute novamente.")
-        return
+    if not entrada.exists():
+        entrada.mkdir()
+        return print(f"Pasta '{entrada}' criada. Adicione os PDFs nela e execute novamente.")
 
-    if not os.path.exists(pasta_saida):
-        os.makedirs(pasta_saida)
+    saida.mkdir(exist_ok=True)
+    if not tpl_lc.exists(): print(f"Aviso: Template '{tpl_lc}' não encontrado!")
+    if not tpl_jw.exists(): print(f"Aviso: Template '{tpl_jw}' não encontrado!")
 
-    if not os.path.exists(template_lc):
-        print(f"Aviso: Template '{template_lc}' não encontrado!")
-    if not os.path.exists(template_jw):
-        print(f"Aviso: Template '{template_jw}' não encontrado!")
-
-    arquivos = [f for f in os.listdir(pasta_entrada) if f.lower().endswith('.pdf')]
-    
-    if not arquivos:
-        print("Nenhum arquivo PDF encontrado em 'notas_entrada'.")
-        return
+    arquivos = list(entrada.glob("*.pdf"))
+    if not arquivos: return print("Nenhum arquivo PDF encontrado em 'notas_entrada'.")
 
     for arquivo in arquivos:
-        caminho_pdf = os.path.join(pasta_entrada, arquivo)
-        print(f"\n--- Processando: {arquivo} ---")
+        print(f"\n--- Processando: {arquivo.name} ---")
+        dados = extrair_dados_pdf(arquivo)
+        
+        # Lógica de Data (-2 dias úteis)
+        dt = dados["data_emissao"]
+        dias_sub = 0
+        while dias_sub < 2:
+            dt -= timedelta(days=1)
+            if dt.weekday() < 5: dias_sub += 1
+        data_fmt = f"{dt.strftime('%d')} DE {MESES[dt.month]} DE {dt.year}"
 
-        # 1. Leitura do PDF
-        dados = extrair_dados_pdf(caminho_pdf)
-        num_nf = dados["numero_nf"] or "000"
+        pasta_nf = saida / f"NF {dados['numero_nf']}"
+        pasta_nf.mkdir(exist_ok=True)
 
-        # 2. Cálculo da Data (-2 dias úteis)
-        data_emissao = dados["data_emissao"] or datetime.now()
-        data_proposta = subtrair_dias_uteis(data_emissao, dias=2)
-        data_formatada = formatar_data_word(data_proposta)
+        if tpl_lc.exists():
+            itens_lc, tot_lc = reajustar_valores(dados["itens"], 0.03)
+            preencher_word(tpl_lc, pasta_nf / f"LC COMERCIAL NF {dados['numero_nf']}.docx", dados, itens_lc, tot_lc, data_fmt)
+            print("  ✓ Proposta LC criada (+3.0%)")
 
-        # Pasta de saída da NF
-        nome_pasta_nf = f"NF {num_nf}"
-        caminho_pasta_nf = os.path.join(pasta_saida, nome_pasta_nf)
-        os.makedirs(caminho_pasta_nf, exist_ok=True)
-
-        # -------------------------------------------------------------
-        # 3. PROPOSTA 1: LC COMERCIAL (Vencedora +3%)
-        # -------------------------------------------------------------
-        if os.path.exists(template_lc):
-            novos_itens_lc, total_lc = reajustar_valores(dados["itens"], percentual=0.03)
-            caminho_lc_final = os.path.join(caminho_pasta_nf, f"LC COMERCIAL NF {num_nf}.docx")
-            preencher_word(template_lc, caminho_lc_final, dados, novos_itens_lc, total_lc, data_formatada, e_template_jw=False)
-            print(f"  ✓ Proposta LC criada: {caminho_lc_final} (+3.0%)")
-
-        # -------------------------------------------------------------
-        # 4. PROPOSTA 2: JW COMERCIAL (2ª Perdedora +5% a +8%)
-        # -------------------------------------------------------------
-        if os.path.exists(template_jw):
+        if tpl_jw.exists():
             margem_jw = random.uniform(0.05, 0.08)
-            novos_itens_jw, total_jw = reajustar_valores(dados["itens"], percentual=margem_jw)
-            caminho_jw_final = os.path.join(caminho_pasta_nf, f"JW COMERCIAL NF {num_nf}.docx")
-            preencher_word(template_jw, caminho_jw_final, dados, novos_itens_jw, total_jw, data_formatada, e_template_jw=True)
-            print(f"  ✓ Proposta JW criada: {caminho_jw_final} (+{margem_jw*100:.2f}%)")
+            itens_jw, tot_jw = reajustar_valores(dados["itens"], margem_jw)
+            preencher_word(tpl_jw, pasta_nf / f"JW COMERCIAL NF {dados['numero_nf']}.docx", dados, itens_jw, tot_jw, data_fmt, is_jw=True)
+            print(f"  ✓ Proposta JW criada (+{margem_jw*100:.2f}%)")
 
 if __name__ == "__main__":
     processar_notas()

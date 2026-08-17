@@ -59,8 +59,10 @@ def retroceder_dias_uteis(data_ref: datetime, dias: int = 3) -> datetime:
 
 
 # --- Processamento de PDF ---
-def extrair_dados_pdf(caminho_pdf: Path) -> dict:
-  """Extrai cabeçalho, cliente e itens da nota fiscal."""
+
+
+def extrair_dados_pdf_produto(caminho_pdf: Path, txt_extraido: str) -> dict:
+  """Lógica original para notas fiscais de produtos (NF-e)."""
   dados = {
       "numero_nf": "000",
       "cliente": "",
@@ -69,11 +71,10 @@ def extrair_dados_pdf(caminho_pdf: Path) -> dict:
       "itens": [],
       "obs": "",
   }
-  txt = ""
-
+  
+  # Extração de tabelas
   with pdfplumber.open(caminho_pdf) as pdf:
     for page in pdf.pages:
-      txt += (page.extract_text() or "") + "\n"
       for table in page.extract_tables():
         for row in table:
           if row and len(row) >= 9 and str(row[0]).isdigit():
@@ -88,36 +89,116 @@ def extrair_dados_pdf(caminho_pdf: Path) -> dict:
             except (ValueError, TypeError):
               continue
 
-  if m := re.search(r"Nº\s*(\d+)", txt):
+  # Extração de cabeçalho via Regex
+  if m := re.search(r"Nº\s*(\d+)", txt_extraido):
     dados["numero_nf"] = m.group(1)
-  if m := re.search(
-      r"DATA DE EMISSÃO\n*(\d{2}/\d{2}/\d{4})|(\d{2}/\d{2}/\d{4})", txt
-  ):
-    dados["data_emissao"] = datetime.strptime(
-        m.group(1) or m.group(2), "%d/%m/%Y"
-    )
-  if m := re.search(r"CNPJ/CPF[^\d]*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", txt):
+  if m := re.search(r"DATA DE EMISSÃO\n*(\d{2}/\d{2}/\d{4})|(\d{2}/\d{2}/\d{4})", txt_extraido):
+    dados["data_emissao"] = datetime.strptime(m.group(1) or m.group(2), "%d/%m/%Y")
+  if m := re.search(r"CNPJ/CPF[^\d]*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", txt_extraido):
     dados["cnpj"] = m.group(1).strip()
-  if m := re.search(r"OBS:\s*([^\n]+)", txt, re.IGNORECASE):
+  if m := re.search(r"OBS:\s*([^\n]+)", txt_extraido, re.IGNORECASE):
     dados["obs"] = m.group(1).strip()
 
-  linhas = txt.split("\n")
+  linhas = txt_extraido.split("\n")
   for i, linha in enumerate(linhas):
     if "NOME/RAZÃO SOCIAL" in linha:
       resto = linha.split("NOME/RAZÃO SOCIAL")[-1].strip()
       dados["cliente"] = (
-          resto
-          if (resto and "CNPJ" not in resto)
-          else (
-              re.sub(r"\s*\d{2}\.\d{3}\.\d{3}/.*", "", linhas[i + 1]).strip()
-              if i + 1 < len(linhas)
-              else ""
-          )
+          resto if (resto and "CNPJ" not in resto)
+          else (re.sub(r"\s*\d{2}\.\d{3}\.\d{3}/.*", "", linhas[i + 1]).strip() if i + 1 < len(linhas) else "")
       )
       break
 
   return dados
 
+def extrair_dados_pdf_servico(txt_extraido: str) -> dict:
+  """Nova lógica dedicada à Nota Fiscal de Serviço (NFS-e) de Fortaleza."""
+  dados = {
+      "numero_nf": "000",
+      "cliente": "",
+      "cnpj": "",
+      "data_emissao": datetime.now(),
+      "itens": [],
+      "obs": "",
+  }
+
+  # 1. Número da NFS-e
+  if m := re.search(r"Número da\s*NFS-e\s*(\d+)", txt_extraido, re.IGNORECASE):
+      dados["numero_nf"] = m.group(1)
+  elif m := re.search(r"NFS-e\s*(\d+)", txt_extraido):
+      dados["numero_nf"] = m.group(1)
+
+  # 2. Data de Emissão
+  if m := re.search(r"(\d{2}/\d{2}/\d{4})", txt_extraido):
+      dados["data_emissao"] = datetime.strptime(m.group(1), "%d/%m/%Y")
+
+  # 3. CNPJ do Tomador
+  if m := re.search(r"(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})", txt_extraido):
+      dados["cnpj"] = m.group(1)
+
+  # 4. Cliente e Observação a partir da discriminação
+  descricao_bruta = ""
+  if m := re.search(r"DISCRIMINAÇÃO DOS SERVIÇOS\n(.*?)(?=\n(-)?[A-Z]|\nValor|\nCálculo)", txt_extraido, re.DOTALL | re.IGNORECASE):
+      descricao_bruta = m.group(1).replace("\n", " ").strip()
+  else:
+      if m := re.search(r"DISCRIMINAÇÃO DOS SERVIÇOS(.*?)Valor", txt_extraido, re.DOTALL | re.IGNORECASE):
+           descricao_bruta = m.group(1).replace("\n", " ").strip()
+
+  if "OBS:" in descricao_bruta.upper():
+      partes = re.split(r"OBS:", descricao_bruta, flags=re.IGNORECASE)
+      descricao_limpa = partes[0].strip()
+      dados["obs"] = partes[1].strip()
+  else:
+      descricao_limpa = descricao_bruta
+
+  # CORREÇÃO 1: Remove textos dinâmicos como "NO VALOR DE R$ 682,80" da descrição
+  descricao_limpa = re.sub(r"\s*NO VALOR DE R\$\s*[\d.,]+", "", descricao_limpa, flags=re.IGNORECASE).strip()
+
+  # 5. Nome do Cliente (Tomador)
+  if m := re.search(r"DADOS DO TOMADOR DE SERVIÇOS[^\n]*\n([^\n]+)\n", txt_extraido):
+      linhas = txt_extraido.split("\n")
+      for i, linha in enumerate(linhas):
+          if "DADOS DO TOMADOR DE SERVIÇOS" in linha:
+              for possivel_cliente in linhas[i+1:i+5]:
+                  if possivel_cliente and len(possivel_cliente) > 5 and "CNPJ" not in possivel_cliente:
+                      # CORREÇÃO 2: Remove o prefixo "Razão Social/Nome" se o PDF aglutinar na mesma linha
+                      cliente_limpo = re.sub(r"^Razão Social/Nome\s*", "", possivel_cliente.strip(), flags=re.IGNORECASE)
+                      dados["cliente"] = cliente_limpo.strip()
+                      break
+              break
+
+  # 6. Valor Líquido ou Valor do Serviço
+  vlr_total = 0.0
+  if m := re.search(r"Valor Líquido R\$\s*([\d.,]+)", txt_extraido):
+       vlr_total = parse_float(m.group(1))
+  elif m := re.search(r"Valor dos Serviços R\$\s*([\d.,]+)", txt_extraido):
+       vlr_total = parse_float(m.group(1))
+
+  # 7. Registra o serviço na tabela (Qtde: 1)
+  dados["itens"].append({
+      "descricao": descricao_limpa if descricao_limpa else "PRESTAÇÃO DE SERVIÇOS",
+      "und": "SV",
+      "qtd": 1.0,
+      "vlr_unit": vlr_total,
+      "vlr_total": vlr_total
+  })
+
+  return dados
+
+def extrair_dados_pdf(caminho_pdf: Path) -> dict:
+  """Função roteadora: extrai o texto base e direciona para a função correta."""
+  txt_extraido = ""
+  with pdfplumber.open(caminho_pdf) as pdf:
+      for page in pdf.pages:
+          txt_extraido += (page.extract_text() or "") + "\n"
+          
+  is_servico = "NOTA FISCAL DE SERVIÇO" in txt_extraido.upper() or "NFS-e" in txt_extraido
+  
+  if is_servico:
+      return extrair_dados_pdf_servico(txt_extraido)
+  else:
+      return extrair_dados_pdf_produto(caminho_pdf, txt_extraido)
+  
 
 def reajustar_valores(itens: list, percentual: float) -> tuple[list, float]:
   """Aplica margem com reajuste no último item para arredondamento exato."""

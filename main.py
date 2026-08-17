@@ -5,12 +5,19 @@ from pathlib import Path
 import pdfplumber
 from docx import Document
 
-# Tenta importar num2words (Fallback mantido)
+# Tenta importar bibliotecas de terceiros (Fallback mantido)
 try:
     from num2words import num2words
     HAS_NUM2WORDS = True
 except ImportError:
     HAS_NUM2WORDS = False
+
+try:
+    import holidays
+    HAS_HOLIDAYS = True
+except ImportError:
+    HAS_HOLIDAYS = False
+    print("Aviso: Biblioteca 'holidays' não encontrada. Feriados não serão descontados. Para instalar, rode: pip install holidays")
 
 # Lista de meses (índice bate com o número do mês)
 MESES = ["", "JANEIRO", "FEVEREIRO", "MARÇO", "ABRIL", "MAIO", "JUNHO", 
@@ -22,12 +29,12 @@ UNIDADES = ["", "um", "dois", "três", "quatro", "cinco", "seis", "sete", "oito"
 DEZENAS = ["", "", "vinte", "trinta", "quarenta", "cinquenta", "sessenta", "setenta", "oitenta", "noventa"]
 CENTENAS = ["", "cento", "duzentos", "trezentos", "quatrocentos", "quinhentos", "seiscentos", "setecentos", "oitocentos", "novecentos"]
 
-# Expressões regulares pré-compiladas (melhor performance)
+# Expressões regulares
 RE_NF = re.compile(r"Nº\s*(\d+)")
 RE_DATA_EMISSAO = re.compile(r"DATA DE EMISSÃO\n*(\d{2}/\d{2}/\d{4})")
 RE_DATA_ANY = re.compile(r"(\d{2}/\d{2}/\d{4})")
-RE_CLIENTE = re.compile(r"NOME/RAZÃO SOCIAL\n*(.*?)\n")
-RE_CNPJ = re.compile(r"CNPJ/CPF\n*(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})")
+RE_CNPJ = re.compile(r"CNPJ/CPF(?:[^\d]*)(\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2})")
+RE_OBS = re.compile(r"OBS:\s*([^\n]+)", re.IGNORECASE)
 
 def format_brl(valor: float) -> str:
     """Formata float para formato moeda BRL (ex: 1.234,56)."""
@@ -76,9 +83,29 @@ def valor_por_extenso(valor: float) -> str:
         except Exception: pass
     return valor_para_extenso_manual(valor)
 
+def is_dia_util(data_ref: datetime) -> bool:
+    """Verifica se a data é um dia útil, excluindo fins de semana e feriados (BR, CE e Fortaleza)."""
+    # 5 = Sábado, 6 = Domingo
+    if data_ref.weekday() >= 5:
+        return False
+        
+    if HAS_HOLIDAYS:
+        # Carrega os feriados do Brasil e do estado do Ceará para o ano da data
+        feriados = holidays.BR(subdiv='CE', years=data_ref.year)
+        
+        # Adiciona os feriados municipais fixos de Fortaleza
+        feriados[datetime(data_ref.year, 4, 13).date()] = "Aniversário de Fortaleza"
+        feriados[datetime(data_ref.year, 8, 15).date()] = "Nossa Senhora da Assunção"
+        
+        # Se a data estiver na lista de feriados, não é dia útil
+        if data_ref.date() in feriados:
+            return False
+            
+    return True
+
 def extrair_dados_pdf(caminho_pdf: Path) -> dict:
     """Extrai informações e itens das páginas da NF."""
-    dados = {"numero_nf": "000", "cliente": "", "cnpj": "", "data_emissao": datetime.now(), "itens": []}
+    dados = {"numero_nf": "000", "cliente": "", "cnpj": "", "data_emissao": datetime.now(), "itens": [], "obs": ""}
     texto_completo = ""
 
     with pdfplumber.open(caminho_pdf) as pdf:
@@ -101,8 +128,21 @@ def extrair_dados_pdf(caminho_pdf: Path) -> dict:
     if match := RE_NF.search(texto_completo): dados["numero_nf"] = match.group(1)
     if match := RE_DATA_EMISSAO.search(texto_completo) or RE_DATA_ANY.search(texto_completo):
         dados["data_emissao"] = datetime.strptime(match.group(1), "%d/%m/%Y")
-    if match := RE_CLIENTE.search(texto_completo): dados["cliente"] = match.group(1).strip()
     if match := RE_CNPJ.search(texto_completo): dados["cnpj"] = match.group(1).strip()
+    if match := RE_OBS.search(texto_completo): dados["obs"] = match.group(1).strip()
+
+    linhas = texto_completo.split('\n')
+    for i, linha in enumerate(linhas):
+        if "NOME/RAZÃO SOCIAL" in linha:
+            texto_restante = linha.split("NOME/RAZÃO SOCIAL")[-1].strip()
+            if not texto_restante or "CNPJ" in texto_restante:
+                if i + 1 < len(linhas):
+                    cli = linhas[i+1].strip()
+                    cli = re.sub(r'\s*\d{2}\.\d{3}\.\d{3}/.*', '', cli)
+                    dados["cliente"] = cli.strip()
+            else:
+                dados["cliente"] = texto_restante
+            break
 
     return dados
 
@@ -149,8 +189,10 @@ def preencher_tabela(tabela, novos_itens: list):
             cells[col["desc"]].text = str(item["descricao"])
             cells[col["und"]].text = str(item["und"])
             cells[col["qtd"]].text = f"{item['qtd']:.0f}" if item['qtd'].is_integer() else f"{item['qtd']:.2f}".replace(".", ",")
-            cells[col["unit"]].text = format_brl(item['vlr_unit'])
-            cells[col["total"]].text = format_brl(item['vlr_total'])
+            
+            # Formatação atualizada com R$ nas tabelas
+            cells[col["unit"]].text = f"R$ {format_brl(item['vlr_unit'])}"
+            cells[col["total"]].text = f"R$ {format_brl(item['vlr_total'])}"
 
 def aplicar_fonte_documento(doc, nome_fonte="Mongolian Baiti"):
     """Modifica fonte do doc inteiro usando achatamento de lista para performance."""
@@ -168,10 +210,18 @@ def preencher_word(template_path: Path, output_path: Path, dados: dict, itens: l
         txt = p.text.upper()
         if txt.startswith("FORTALEZA") and " DE " in txt:
             p.text = f"{'FORTALEZA' if p.text.isupper() else 'Fortaleza'}, {data_fmt}"
+        
         elif "CLIENTE:" in txt and dados.get("cliente"):
-            p.text = f"Cliente: {dados['cliente']}"
-        elif "CNPJ:" in txt and dados.get("cnpj") and not is_jw:
+            partes = [f"Cliente: {dados['cliente']}"]
+            if dados.get("obs"):
+                partes.append(dados["obs"])
+            if is_jw and dados.get("cnpj"):
+                partes.append(f"CNPJ: {dados['cnpj']}")
+            p.text = "\n".join(partes)
+            
+        elif "CNPJ:" in txt and not is_jw and dados.get("cnpj"):
             p.text = f"CNPJ: {dados['cnpj']}"
+        
         elif is_jw and "VALOR DA PROPOSTA" in txt:
             p.text = f"Valor da Proposta R$ {val_str} ({ext_str})"
         elif not is_jw and "VALOR TOTAL DA PROPOSTA:" in txt:
@@ -209,13 +259,17 @@ def processar_notas():
         print(f"\n--- Processando: {arquivo.name} ---")
         dados = extrair_dados_pdf(arquivo)
         
-        # Lógica de Data (-2 dias úteis)
+        # --- NOVA LÓGICA DE DATA: -3 dias úteis ignorando feriados ---
         dt = dados["data_emissao"]
         dias_sub = 0
-        while dias_sub < 2:
+        while dias_sub < 3:
             dt -= timedelta(days=1)
-            if dt.weekday() < 5: dias_sub += 1
+            # Só contabiliza se for dia útil e não for feriado
+            if is_dia_util(dt):
+                dias_sub += 1
+                
         data_fmt = f"{dt.strftime('%d')} DE {MESES[dt.month]} DE {dt.year}"
+        # -------------------------------------------------------------
 
         pasta_nf = saida / f"NF {dados['numero_nf']}"
         pasta_nf.mkdir(exist_ok=True)
@@ -223,13 +277,13 @@ def processar_notas():
         if tpl_lc.exists():
             itens_lc, tot_lc = reajustar_valores(dados["itens"], 0.03)
             preencher_word(tpl_lc, pasta_nf / f"LC COMERCIAL NF {dados['numero_nf']}.docx", dados, itens_lc, tot_lc, data_fmt)
-            print("  ✓ Proposta LC criada (+3.0%)")
+            print(f"  ✓ Proposta LC criada (+3.0%) - Data orçada: {dt.strftime('%d/%m/%Y')}")
 
         if tpl_jw.exists():
             margem_jw = random.uniform(0.05, 0.08)
             itens_jw, tot_jw = reajustar_valores(dados["itens"], margem_jw)
             preencher_word(tpl_jw, pasta_nf / f"JW COMERCIAL NF {dados['numero_nf']}.docx", dados, itens_jw, tot_jw, data_fmt, is_jw=True)
-            print(f"  ✓ Proposta JW criada (+{margem_jw*100:.2f}%)")
+            print(f"  ✓ Proposta JW criada (+{margem_jw*100:.2f}%) - Data orçada: {dt.strftime('%d/%m/%Y')}")
 
 if __name__ == "__main__":
     processar_notas()
